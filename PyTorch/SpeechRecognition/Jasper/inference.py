@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--output_dir", default="results/", type=str, help="Output directory to store exported models. Only used if --export_model is used")
     parser.add_argument("--export_model", action='store_true', help="Exports the audio_featurizer, encoder and decoder using torch.jit to the output_dir")
     parser.add_argument("--wav", type=str, help='absolute path to .wav file (16KHz)')
+    parser.add_argument("--cpu_run", action="store_true", help="Run inference on CPU")
     return parser.parse_args()
 
 def calc_wer(data_layer, audio_processor, 
@@ -75,8 +76,9 @@ def calc_wer(data_layer, audio_processor,
         for it, data in enumerate(tqdm(data_layer.data_iterator)):
 
             tensors = []
+            dl_device = torch.device("cpu") if args.cpu_run else torch.device("cuda")
             for d in data:
-                tensors.append(d.cuda())
+                tensors.append(d.to(dl_device))
     
             t_audio_signal_e, t_a_sig_length_e, t_transcript_e, t_transcript_len_e = tensors
     
@@ -137,12 +139,14 @@ def jit_export(
 
                 return traced_module_feat, traced_module_acoustic, traced_module_decode
 
-def run_once(audio_processor, encoderdecoder, greedy_decoder, audio, audio_len, labels):
+def run_once(audio_processor, encoderdecoder, greedy_decoder, audio, audio_len, labels, cpu_run):
             features = audio_processor(audio, audio_len)
-            torch.cuda.synchronize()
+            if not cpu_run:
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
             t_log_probs_e = encoderdecoder(features[0])
-            torch.cuda.synchronize()
+            if not cpu_run:
+                torch.cuda.synchronize()
             t1 = time.perf_counter()
             t_predictions_e = greedy_decoder(log_probs=t_log_probs_e)
             hypotheses = __ctc_decoder_predictions_tensor(t_predictions_e, labels=labels)
@@ -173,12 +177,10 @@ def eval(
     with torch.no_grad():
         if args.wav:
             audio, audio_len = audio_from_file(args.wav)
-            run_once(audio_processor, encoderdecoder, greedy_decoder, audio, audio_len, labels)
+            run_once(audio_processor, encoderdecoder, greedy_decoder, audio, audio_len, labels, args.cpu_run)
             if args.export_model:
-                jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder = jit_export(audio, audio_len, audio_processor,
-                                                                                         encoderdecoder,
-                                                                                         greedy_decoder,args)
-            run_once(jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder, audio, audio_len, labels)
+                jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder = jit_export(audio, audio_len, audio_processor, encoderdecoder,greedy_decoder,args)
+            run_once(jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder, audio, audio_len, labels, args.cpu_run)
             return
         wer, _global_var_dict = calc_wer(data_layer, audio_processor, encoderdecoder, greedy_decoder, labels, args)
         if (not multi_gpu or (multi_gpu and torch.distributed.get_rank() == 0)):
@@ -210,7 +212,8 @@ def main(args):
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
     print("CUDNN BENCHMARK ", args.cudnn_benchmark)
-    assert(torch.cuda.is_available())
+    if not args.cpu_run:
+        assert(torch.cuda.is_available())
 
     if args.local_rank is not None:
         torch.cuda.set_device(args.local_rank)
@@ -298,8 +301,9 @@ def main(args):
             print('-----------------')
 
     print ("audio_preprocessor.normalize: ", audio_preprocessor.featurizer.normalize)
-    audio_preprocessor.cuda()
-    encoderdecoder.cuda()
+    if not args.cpu_run:
+        audio_preprocessor.cuda()
+        encoderdecoder.cuda()
     if args.fp16:
         encoderdecoder = amp.initialize( models=encoderdecoder,
                                          opt_level=AmpOptimizations[optim_level])

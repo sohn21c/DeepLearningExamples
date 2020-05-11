@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--ckpt", default=None, type=str, required=True, help='path to model checkpoint')
     parser.add_argument("--fp16", action='store_true', help='use half precision')
     parser.add_argument("--seed", default=42, type=int, help='seed')
+    parser.add_argument("--cpu_run", action='store_true', help='Run inference on CPU')
     return parser.parse_args()
 
 def eval(
@@ -85,20 +86,23 @@ def eval(
                 if it > steps:
                     break
                 tensors = []
-                dl_device = torch.device("cuda")
+                dl_device = torch.device("cpu") if args.cpu_run else torch.device("cuda")
                 for d in data:
                     tensors.append(d.to(dl_device))
      
                 t_audio_signal_e, t_a_sig_length_e, t_transcript_e, t_transcript_len_e = tensors
-                torch.cuda.synchronize()
+                if not args.cpu_run:
+                    torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 t_processed_signal = audio_processor(t_audio_signal_e, t_a_sig_length_e)
-                torch.cuda.synchronize()
+                if not args.cpu_run:
+                    torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 
                 t_log_probs_e, _  = encoderdecoder.infer(t_processed_signal)
 
-                torch.cuda.synchronize()
+                if not args.cpu_run:
+                    torch.cuda.synchronize()
                 stop_time = time.perf_counter()
 
                 time_prep_and_dnn = stop_time - t0
@@ -154,7 +158,8 @@ def main(args):
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
     assert(args.steps is None or args.steps > 5)
     print("CUDNN BENCHMARK ", args.cudnn_benchmark)
-    assert(torch.cuda.is_available())
+    if not args.cpu_run:
+        assert(torch.cuda.is_available())
 
     if args.fp16:
         optim_level = 3
@@ -223,8 +228,9 @@ def main(args):
         print('Have {0} steps / (gpu * epoch).'.format(args.steps))
     print('-----------------')
 
-    audio_preprocessor.cuda()
-    encoderdecoder.cuda()
+    if not args.cpu_run:
+        audio_preprocessor.cuda()
+        encoderdecoder.cuda()
     if args.fp16:
         encoderdecoder = amp.initialize(
             models=encoderdecoder,
