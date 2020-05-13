@@ -28,6 +28,7 @@ from apex import amp
 from dataset import AudioToTextDataLayer
 from helpers import process_evaluation_batch, process_evaluation_epoch, add_ctc_labels, AmpOptimizations, print_dict
 from model import AudioPreprocessing, GreedyCTCDecoder, JasperEncoderDecoder
+from parts.features import audio_from_file
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Jasper')
@@ -42,8 +43,42 @@ def parse_args():
     parser.add_argument("--ckpt", default=None, type=str, required=True, help='path to model checkpoint')
     parser.add_argument("--fp16", action='store_true', help='use half precision')
     parser.add_argument("--seed", default=42, type=int, help='seed')
-    parser.add_argument("--cpu_run", action='store_true', help='Run inference on CPU')
+    parser.add_argument("--cpu_run", action='store_true', help='run inference on CPU')
+    parser.add_argument("--sample_audio", default="/datasets/LibriSpeech/dev-clean-wav/1272/128104/1272-128104-0000.wav", type=str, help='audio sample path for torchscript, points to one of the files in /datasets/LibriSpeech/dev-clean-wav/ if not defined')
     return parser.parse_args()
+
+def jit_export(
+         audio,
+         audio_len,
+         audio_processor,
+         encoderdecoder,
+         greedy_decoder,
+         args):
+    """applies torchscript
+    Args:
+        audio:
+        audio_len: 
+        audio_processor: data processing module
+        encoderdecoder: acoustic model
+        greedy_decoder: greedy decoder
+        args: script input arguments
+    """
+    # Export just the featurizer
+    print("torchscripting featurizer ...")
+    traced_module_feat = torch.jit.script(audio_processor)
+
+    # Export just the acoustic model
+    print("torchscripting acoustic model ...")
+    inp_postFeat, _ = audio_processor(audio, audio_len)
+    traced_module_acoustic = torch.jit.trace(encoderdecoder, inp_postFeat)
+
+    # Export just the decoder
+    print("torchscripting decoder ...")
+    inp_postAcoustic = encoderdecoder(inp_postFeat)
+    traced_module_decode = torch.jit.script(greedy_decoder, inp_postAcoustic)
+    print("JIT process complete")
+
+    return traced_module_feat, traced_module_acoustic, traced_module_decode
 
 def eval(
         data_layer,
@@ -65,6 +100,13 @@ def eval(
     steps=args.steps
     audio_processor.eval()
     encoderdecoder.eval()
+    greedy_decoder.eval()
+
+    # TORCHSCRIPT
+    if args.cpu_run:
+        audio, audio_len = audio_from_file(args.sample_audio, cpu_run=True)
+        jit_audio_processor, jit_encoderdecoder, jit_greedy_decoder = jit_export(audio, audio_len, audio_processor, encoderdecoder, greedy_decoder, args)
+
     with torch.no_grad():
         _global_var_dict = {
             'predictions': [],
@@ -93,21 +135,25 @@ def eval(
                 t_audio_signal_e, t_a_sig_length_e, t_transcript_e, t_transcript_len_e = tensors
                 if not args.cpu_run:
                     torch.cuda.synchronize()
-                t0 = time.perf_counter()
-                t_processed_signal = audio_processor(t_audio_signal_e, t_a_sig_length_e)
-                if not args.cpu_run:
+                    t0 = time.perf_counter()
+                    t_processed_signal = audio_processor(t_audio_signal_e, t_a_sig_length_e)
                     torch.cuda.synchronize()
-                t1 = time.perf_counter()
-                
-                t_log_probs_e, _  = encoderdecoder.infer(t_processed_signal)
-
-                if not args.cpu_run:
+                    t1 = time.perf_counter()
+                    t_log_probs_e, _  = encoderdecoder.infer(t_processed_signal)
                     torch.cuda.synchronize()
-                stop_time = time.perf_counter()
-
-                time_prep_and_dnn = stop_time - t0
-                time_dnn = stop_time - t1
-                t_predictions_e = greedy_decoder(log_probs=t_log_probs_e)
+                    stop_time = time.perf_counter()
+                    time_prep_and_dnn = stop_time - t0
+                    time_dnn = stop_time - t1
+                    t_predictions_e = greedy_decoder(log_probs=t_log_probs_e)
+                if args.cpu_run:
+                    t0 = time.perf_counter()
+                    t_processed_signal, _ = jit_audio_processor(t_audio_signal_e, t_a_sig_length_e)
+                    t1 = time.perf_counter()
+                    t_log_probs_e, _  = jit_encoderdecoder(t_processed_signal)
+                    stop_time = time.perf_counter()
+                    time_prep_and_dnn = stop_time - t0
+                    time_dnn = stop_time - t1
+                    t_predictions_e = jit_greedy_decoder(log_probs=t_log_probs_e)
 
                 values_dict = dict(
                     predictions=[t_predictions_e],
@@ -220,12 +266,20 @@ def main(args):
     step_per_epoch = math.ceil(N / args.batch_size)
 
     print('-----------------')
-    if args.steps is None:
-        print('Have {0} examples to eval on.'.format(N))
-        print('Have {0} steps / (gpu * epoch).'.format(step_per_epoch))
+    if not args.cpu_run:
+        if args.steps is None:
+            print('Have {0} examples to eval on.'.format(N))
+            print('Have {0} steps / (gpu * epoch).'.format(step_per_epoch))
+        else:
+            print('Have {0} examples to eval on.'.format(args.steps * args.batch_size))
+            print('Have {0} steps / (gpu * epoch).'.format(args.steps))
     else:
-        print('Have {0} examples to eval on.'.format(args.steps * args.batch_size))
-        print('Have {0} steps / (gpu * epoch).'.format(args.steps))
+        if args.steps is None:
+            print('Have {0} examples to eval on.'.format(N))
+            print('Have {0} steps / (epoch).'.format(step_per_epoch))
+        else:
+            print('Have {0} examples to eval on.'.format(args.steps * args.batch_size))
+            print('Have {0} steps / (epoch).'.format(args.steps))
     print('-----------------')
 
     if not args.cpu_run:

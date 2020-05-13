@@ -30,6 +30,7 @@ MAX_DURATION=${9:-"36"}
 SEED=${10:-0}
 BATCH_SIZE=${11:-64}
 CPU_RUN=${12:-"true"}
+SAMPLE_AUDIO=${13:-"/datasets/LibriSpeech/dev-clean-wav/1272/128104/1272-128104-0000.wav"}
 
 PREC=""
 if [ "$PRECISION" = "fp16" ] ; then
@@ -62,6 +63,7 @@ CMD+=" --pad_to=-1"
 CMD+=" $PREC"
 CMD+=" $STEPS"
 CMD+=" $CPU_RUN"
+CMD+=" --sample_audio=$SAMPLE_AUDIO"
 
 
 if [ "$CREATE_LOGFILE" = "true" ] ; then

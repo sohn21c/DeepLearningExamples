@@ -188,7 +188,14 @@ class JasperEncoder(nn.Module):
 
     def forward(self, x):
         if self.use_conv_mask:
-            audio_signal, length = x
+            if len(x) == 2:
+                audio_signal, length = x
+                print(length)
+            else:
+                # torchscript
+                audio_signal = x
+                length = torch.tensor([93680], dtype=torch.int32)
+
             return self.encoder(([audio_signal], length))
         else:
             return self.encoder([x])
